@@ -370,8 +370,6 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_remove_another_agents_job_by_id() {
-        // The by-name counterpart of this is asserted above; an ID must not be
-        // a way around it, since cron_list hands out IDs.
         let tmp = TempDir::new().unwrap();
         let cfg = two_agent_config(&tmp);
         let theirs = named_job(&cfg, OTHER_AGENT, "secret_job", "echo secret");

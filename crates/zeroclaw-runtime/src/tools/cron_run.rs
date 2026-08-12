@@ -435,9 +435,8 @@ mod tests {
         assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
     }
 
-    /// A job owned by an agent other than the one under test. An agent job,
-    /// because it needs no risk profile for the owner — the point is the
-    /// ownership boundary, not the job body.
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
     fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
         cron::add_agent_job(
             cfg,
