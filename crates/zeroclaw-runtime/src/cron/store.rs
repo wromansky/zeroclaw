@@ -255,13 +255,28 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// A job the calling agent owns. A job owned by anyone else is reported as
+/// missing rather than refused, so the caller cannot use this to learn that
+/// another agent's job exists. Jobs with no owner (rows predating the
+/// `agent_alias` column) belong to no agent and stay reachable only through the
+/// operator surfaces — CLI, RPC and the gateway API — which are not agent-scoped.
+pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
+    let job = get_job(config, job_id)?;
+    if job.agent_alias == agent_alias {
+        Ok(job)
+    } else {
+        anyhow::bail!("Cron job '{job_id}' not found")
+    }
+}
+
 pub fn resolve_job_id_or_name(
     config: &Config,
     id_or_name: &str,
     agent_alias: &str,
 ) -> Result<String> {
-    // Fast path: try exact ID lookup first.
-    if let Ok(job) = get_job(config, id_or_name) {
+    // Fast path: try exact ID lookup first, scoped the same way the name
+    // fallback below is — an ID must not reach another agent's job.
+    if let Ok(job) = get_job_for_agent(config, id_or_name, agent_alias) {
         return Ok(job.id);
     }
 
@@ -3398,6 +3413,56 @@ schedule = { kind = "every", every_ms = 300000 }
             resolved, mine.id,
             "name must resolve to the caller's own job, not the other agent's"
         );
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_id() {
+        // The ID fast path must be scoped exactly like the name fallback:
+        // knowing another agent's job ID must not be enough to act on it.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unreachable by ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_job_for_agent_reports_another_agents_job_as_missing() {
+        // Reported as missing rather than refused, so the error cannot be used
+        // to confirm that another agent's job exists.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            None,
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        assert!(get_job_for_agent(&config, &theirs.id, "agent-b").is_ok());
+        let err = get_job_for_agent(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
     #[test]
