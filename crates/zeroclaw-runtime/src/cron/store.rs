@@ -1816,10 +1816,15 @@ mod tests {
     }
 
     #[test]
-    fn scoped_remove_survives_ownership_moving_after_the_check() {
+    fn scoped_remove_guarded_delete_refuses_a_stale_owner() {
         // The race the separate read cannot cover: the caller was authorized, then
         // the operator's rename cascade moved the job to another agent. Matching
         // both columns in the DELETE means the stale authorization writes nothing.
+        //
+        // `remove_job_for_agent` has no preliminary read, so this reaches the
+        // guarded DELETE itself. It is a stale-owner write, not a deterministic
+        // interleaving: the rename lands before the call rather than between a
+        // successful read and the write.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
@@ -1840,7 +1845,10 @@ mod tests {
     }
 
     #[test]
-    fn scoped_update_survives_ownership_moving_after_the_check() {
+    fn scoped_update_read_check_refuses_a_stale_owner() {
+        // This one stops at `update_job_for_agent`'s preliminary ownership read,
+        // so it never reaches the guarded UPDATE. The test below covers that
+        // statement directly.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
@@ -1864,6 +1872,40 @@ mod tests {
         assert!(
             get_job(&config, &job.id).unwrap().enabled,
             "the job's state must be untouched by the refused patch"
+        );
+    }
+
+    #[test]
+    fn scoped_update_guarded_write_refuses_a_stale_owner() {
+        // Calls `update_job_inner` directly with the stale owner, which is what
+        // the guarded UPDATE sees once the preliminary read is out of the way.
+        // Without the `agent_alias` term in the WHERE clause this patch lands.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_inner(
+            &config,
+            &job.id,
+            Some("owner-agent"),
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "the guarded UPDATE must match no row for the former owner"
+        );
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "the refused patch must not change the job");
+        assert_eq!(
+            after.agent_alias, "new-owner",
+            "the job must remain with its new owner"
         );
     }
 
