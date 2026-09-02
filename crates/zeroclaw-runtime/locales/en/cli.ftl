@@ -915,6 +915,10 @@ turn-stream-interrupted = [stream interrupted]
 # one requested, so silent model downgrades stay visible on direct-turn
 # surfaces (WS, RPC/ZeroCode, ACP).
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
+# Appended to a final answer that asserts an action when the turn's tool-receipt
+# collector holds no qualifying receipt, so the action provably never ran. Only
+# reached after the runtime has already re-sampled the answer once.
+turn-unverified-claim-notice = ⚠️ Unverified: this reply claims an action, but no tool performed it. Treat it as NOT done.
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*

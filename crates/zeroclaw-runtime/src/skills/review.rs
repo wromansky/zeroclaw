@@ -124,6 +124,7 @@ pub async fn maybe_run_skill_review(
                 shared_budget: None,
                 channel: None,
                 collected_receipts: Some(&receipts),
+                claim_check: None,
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,

@@ -110,6 +110,11 @@ pub struct ToolLoop<'a> {
     pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
+    /// Borrowed receipt config for the receipt-verified claim check. `None`
+    /// on paths that do not surface a reply to a human (nested sub-loops,
+    /// embedders). Read alongside `collected_receipts`, which is the evidence
+    /// the check consults; the config itself stays owned by the agent.
+    pub claim_check: Option<&'a zeroclaw_config::schema::ToolReceiptsConfig>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
@@ -300,6 +305,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         shared_budget,
         channel,
         collected_receipts,
+        claim_check,
         event_tx,
         mut steering,
         new_messages_out: raw_canonical,
@@ -469,6 +475,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // steps drain across several iterations.
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
+
+    // Receipt-verified claim check: one re-sample per turn, spent only on a
+    // final answer that asserts an action no tool performed. See
+    // `crate::agent::claim_guard`.
+    let claim_check = claim_check.filter(|c| c.enabled && c.verify_claims);
+    let mut claim_rerolls_left = usize::from(claim_check.is_some());
 
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
@@ -822,7 +834,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         };
 
-        let display_text = resolve_display_text(
+        let mut display_text = resolve_display_text(
             &response_text,
             &parsed_text,
             !tool_calls.is_empty(),
@@ -902,6 +914,70 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if tool_calls.is_empty() {
+            // ── Receipt-verified claim check ────────────────────────────
+            // A known failure mode of tool-using models: the reasoning states
+            // the intent ("Let me log it."), then the model emits prose
+            // instead of the tool call and asserts the action anyway. The
+            // per-turn receipt collector is empty, which is the proof.
+            if let Some(cfg) = claim_check {
+                let receipts: Vec<String> = collected_receipts
+                    .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .unwrap_or_default();
+                if crate::agent::claim_guard::asserts_action(&display_text, &cfg.claim_patterns)
+                    && !crate::agent::claim_guard::has_qualifying_receipt(
+                        &receipts,
+                        &cfg.write_tools,
+                    )
+                {
+                    // Re-sample once when NOTHING ran and nothing was
+                    // delivered: an empty collector means there is no side
+                    // effect to duplicate, and un-streamed text means there is
+                    // nothing to retract. History is untouched at this point,
+                    // so `continue` is a clean redraw of the same prompt.
+                    if claim_rerolls_left > 0 && receipts.is_empty() && !response_streamed_live {
+                        claim_rerolls_left -= 1;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Retry
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "iteration": iteration + 1,
+                                "trace_id": turn_id,
+                            })),
+                            "unverified_claim: re-sampling a final answer that asserts an \
+                             action no tool performed"
+                        );
+                        continue;
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "iteration": iteration + 1,
+                                "receipts": receipts.len(),
+                                "streamed_live": response_streamed_live,
+                                "trace_id": turn_id,
+                            })),
+                        "unverified_claim: reply asserts an action with no qualifying receipt"
+                    );
+                    // Display only. The history message below keeps the model's
+                    // own words, so the next turn is not primed with a runtime
+                    // warning it did not write.
+                    display_text.push_str("\n\n");
+                    display_text.push_str(&crate::i18n::get_required_cli_string(
+                        "turn-unverified-claim-notice",
+                    ));
+                }
+            }
+
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -1897,6 +1973,9 @@ async fn drive_live_sop_actions(
                             let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
+                                    // Nested SOP step: its text is not the
+                                    // turn's user-visible final answer.
+                                    claim_check: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,

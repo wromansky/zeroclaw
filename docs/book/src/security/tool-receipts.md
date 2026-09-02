@@ -50,7 +50,7 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 ### What receipts don't do
 
 - **Don't constrain text output.** The model can still say things unrelated to any tool call.
-- **Don't force tool use.** Receipts are only generated when a tool is called; they don't help with "the model answered from prior knowledge when it should have looked something up".
+- **Don't force tool use.** Receipts are only generated when a tool is called. They do not make the model call one. `verify_claims` (below) turns the *absence* of a receipt into a visible warning, but nothing blocks the reply.
 - **Don't cover blocked or failed calls.** Approval denials, timeouts, blocked calls, and failed tool returns are observability or audit events, not receipt-bearing tool results.
 - **Don't travel across receipt scopes.** Receipt keys are ephemeral, so a receipt generated under one scope cannot be verified after that scope is gone.
 - **Don't isolate channels or conversations from each other within one channel runtime context.** Channel-server conversations in that context share the key. The threat model targets LLM fabrication inside the runtime, not cross-channel forgery.
@@ -94,6 +94,49 @@ Because the model sees receipts in its context, it may echo them when describing
 
 ## Configuration
 
+### Verifying claims (`verify_claims`)
+
+A receipt proves that a tool result the model *cites* came from the runtime. It cannot help when the model cites nothing: it narrates the action in prose and emits no tool call at all. The per-turn receipt collector is then empty, and that emptiness is itself the signal.
+
+With `[agents.<alias>.tool_receipts] verify_claims = true`, the runtime checks every final answer before the turn returns. If the answer matches one of `claim_patterns` and the turn produced no qualifying receipt, the runtime **re-samples the answer once**, then warns if the claim survives.
+
+```toml
+[agents.trainer.tool_receipts]
+enabled = true
+verify_claims = true
+# Substrings that mean "I did it" for THIS agent. Empty by default.
+claim_patterns = ["logged", "recorded"]
+# Tool names that satisfy a claim. Empty means any executed tool does.
+write_tools = ["log_set", "update_workout_log"]
+```
+
+`claim_patterns` ships **empty**, so enabling `verify_claims` alone changes nothing. That is deliberate: the vocabulary that means "I did it" is agent-specific, and matching is unanchored substring, so a generic default like `"sent"` would fire inside *present*, *absent*, and *consent*. Choose the few words your agent actually uses, and prefer distinctive ones.
+
+Set `write_tools` when the agent commonly runs reads on the same turn it claims a write. With the list empty, a turn that called only a read tool counts as verified.
+
+#### The re-sample, and when it is skipped
+
+The re-sample is safe precisely because of what triggers it. It runs only when **no tool executed at all** and **the answer was not already streamed to the user**:
+
+- An empty collector means there is no side effect to duplicate.
+- Un-streamed text means there is nothing to retract.
+- Conversation history is not yet updated, so the retry re-draws the same prompt rather than showing the model its own discarded answer.
+
+When either condition fails — a read tool ran, or the text was streamed live — the runtime skips the retry and appends the warning instead. One re-sample per turn; a claim that survives it ships with the warning attached.
+
+The warning is added to the delivered text only. The assistant message stored in history keeps the model's own words, so the next turn is not primed with a runtime notice it did not write.
+
+#### Where it applies
+
+The check lives in the shared tool-call loop, so it covers every surface that produces a user-visible reply: channel agents, the gateway, ACP, and direct CLI turns. Nested SOP step loops and delegate sub-agents are deliberately exempt — their text becomes a tool result for the parent turn, and the parent's own final answer is what gets checked.
+
+#### Limits
+
+- **It cannot force a tool call.** It re-rolls the dice once and then tells the truth about the outcome.
+- **A read tool satisfies a claim by default.** With `write_tools` empty, a turn that read state and then fabricated a write counts as verified. Name the write tools to close that.
+- **Substring matching has no word boundaries.** A reply quoting the user ("you asked if I logged it") can match. Prefer distinctive patterns.
+- **It interacts with the response cache.** With `response_cache_enabled = true` (off by default), a flagged tool-free reply can be cached with its warning and replayed.
+
 ## Security properties
 
 - **Ephemeral in-memory key.** Held only in the active receipt scope: channel-server paths use the channel runtime context, and direct turn paths use a per-turn scope. Never persisted, never logged, never in the model's context. Compromising long-term storage gains nothing.
@@ -116,6 +159,7 @@ Because the model sees receipts in its context, it may echo them when describing
 | Debug log of receipts | Shipped |
 | `show_in_response` | Shipped |
 | System-prompt instruction to echo receipts | Shipped |
+| `verify_claims` re-sample + warning on unreceipted claims | Shipped |
 | Persistent audit database of receipts | Planned |
 | Cross-scope receipt verification | Not planned (see ephemeral-key design) |
 

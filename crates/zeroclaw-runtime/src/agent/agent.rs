@@ -2377,6 +2377,9 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        // Cloned rather than borrowed: the `ToolLoop` literal below also takes
+        // `&mut self` fields, so a live `&self.config` borrow cannot coexist.
+        let claim_check = self.config.resolved.tool_receipts.clone();
         let agent_alias_for_loop = self.observer_agent_alias();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -2435,6 +2438,7 @@ impl Agent {
                         collected_receipts: receipt_scope
                             .as_ref()
                             .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        claim_check: Some(&claim_check),
                         event_tx: None,
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
@@ -2722,6 +2726,9 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        // Cloned rather than borrowed: the `ToolLoop` literal below also takes
+        // `&mut self` fields, so a live `&self.config` borrow cannot coexist.
+        let claim_check = self.config.resolved.tool_receipts.clone();
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -2843,6 +2850,7 @@ impl Agent {
                         collected_receipts: receipt_scope
                             .as_ref()
                             .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        claim_check: Some(&claim_check),
                         event_tx: Some(event_tx.clone()),
                         steering: None,
                         new_messages_out: Some(&mut round_added),
@@ -5932,6 +5940,113 @@ mod tests {
             history_has_receipt(&agent),
             "receipts are still signed into history when only the reply block is off"
         );
+    }
+
+    fn claim_check_config(
+        verify: bool,
+        patterns: &[&str],
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                tool_receipts: zeroclaw_config::schema::ToolReceiptsConfig {
+                    enabled: true,
+                    verify_claims: verify,
+                    claim_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        }
+    }
+
+    fn agent_answering(
+        texts: &[&str],
+        config: zeroclaw_config::schema::AliasedAgentConfig,
+    ) -> Agent {
+        let responses: Vec<zeroclaw_providers::ChatResponse> = texts
+            .iter()
+            .map(|t| zeroclaw_providers::ChatResponse {
+                text: Some((*t).to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+            .collect();
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(responses),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    // The failure this guard exists for: a final answer asserting an action
+    // that no tool performed. Nothing ran and nothing was delivered, so the
+    // runtime re-samples and the second answer is what ships.
+    #[tokio::test]
+    async fn unverified_claim_is_resampled_once() {
+        let mut agent = agent_answering(
+            &["Logged it.", "Nothing to log — you did not report a set."],
+            claim_check_config(true, &["logged"]),
+        );
+        let response = agent.turn("did you log it?").await.expect("turn succeeds");
+        assert_eq!(response, "Nothing to log — you did not report a set.");
+    }
+
+    // One re-sample only. A claim that survives it still reaches the user,
+    // carrying the runtime's warning.
+    #[tokio::test]
+    async fn a_surviving_claim_ships_with_the_warning() {
+        let mut agent = agent_answering(
+            &["Logged it.", "Logged it, really."],
+            claim_check_config(true, &["logged"]),
+        );
+        let response = agent.turn("did you log it?").await.expect("turn succeeds");
+        assert!(
+            response.starts_with("Logged it, really."),
+            "the second sample is what ships, got: {response}"
+        );
+        assert!(
+            response.contains("Unverified:"),
+            "a surviving claim must carry the warning, got: {response}"
+        );
+    }
+
+    // Control: off by default, so existing deployments see no change.
+    #[tokio::test]
+    async fn verify_claims_off_leaves_the_reply_untouched() {
+        let mut agent = agent_answering(
+            &["Logged it.", "second"],
+            claim_check_config(false, &["logged"]),
+        );
+        let response = agent.turn("did you log it?").await.expect("turn succeeds");
+        assert_eq!(response, "Logged it.");
+    }
+
+    // Control: enabling the check without naming any pattern is inert. The
+    // default `claim_patterns` list is empty precisely so this is the
+    // first-enable behaviour.
+    #[tokio::test]
+    async fn no_claim_patterns_means_no_check() {
+        let mut agent = agent_answering(&["Logged it.", "second"], claim_check_config(true, &[]));
+        let response = agent.turn("did you log it?").await.expect("turn succeeds");
+        assert_eq!(response, "Logged it.");
     }
 
     // The receipt-echo system-prompt addendum is added on the turn path when

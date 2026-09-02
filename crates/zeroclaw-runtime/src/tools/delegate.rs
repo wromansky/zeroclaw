@@ -2628,6 +2628,9 @@ impl DelegateTool {
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
+                // A delegate's reply becomes a tool result for the parent turn;
+                // the parent's own final answer is what gets checked.
+                claim_check: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,

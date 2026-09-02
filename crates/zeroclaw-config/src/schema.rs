@@ -5912,6 +5912,26 @@ pub struct ToolReceiptsConfig {
     /// No effect when `enabled = false`.
     #[serde(default = "default_inject_system_prompt")]
     pub inject_system_prompt: bool,
+    /// Check every final answer against the turn's receipt collector: when the
+    /// reply matches one of `claim_patterns` and no qualifying receipt exists,
+    /// the action provably never ran. The runtime re-samples the answer once
+    /// when nothing was executed or delivered, then warns if the claim
+    /// survives. Default: `false`; also needs a non-empty `claim_patterns`.
+    /// No effect when `enabled = false`, since receipts are the evidence.
+    #[serde(default)]
+    pub verify_claims: bool,
+    /// Case-insensitive substrings that mark a reply as asserting an action,
+    /// e.g. `["logged", "recorded"]`. Deliberately EMPTY by default: the
+    /// vocabulary that means "I did it" is agent-specific, and unanchored
+    /// substrings of common English words ("sent" inside "present") would
+    /// flag ordinary prose. An empty list disables the check.
+    #[serde(default)]
+    pub claim_patterns: Vec<String>,
+    /// Tool-name substrings that satisfy a claim. Empty (the default) means
+    /// any executed tool satisfies it; set it to the write tools when the
+    /// agent also runs reads on a claiming turn.
+    #[serde(default)]
+    pub write_tools: Vec<String>,
 }
 
 fn default_inject_system_prompt() -> bool {
@@ -5924,6 +5944,9 @@ impl Default for ToolReceiptsConfig {
             enabled: false,
             show_in_response: false,
             inject_system_prompt: default_inject_system_prompt(),
+            verify_claims: false,
+            claim_patterns: Vec::new(),
+            write_tools: Vec::new(),
         }
     }
 }
