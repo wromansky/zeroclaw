@@ -1292,6 +1292,24 @@ mod tests {
     }
 
     #[test]
+    fn mcp_intake_error_and_unknown_fields_keep_the_envelope() {
+        let dir = tempdir().unwrap();
+        for result in [
+            json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "tool failed" }],
+            }),
+            json!({
+                "content": [{ "type": "text", "text": "plain" }],
+                "traceId": "request-7",
+            }),
+        ] {
+            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            assert!(out.starts_with('{'), "envelope dropped: {out}");
+        }
+    }
+
+    #[test]
     fn mcp_intake_joins_multiple_text_blocks() {
         let dir = tempdir().unwrap();
         let result = json!({
